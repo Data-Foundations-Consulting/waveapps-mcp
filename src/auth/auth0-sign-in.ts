@@ -33,16 +33,36 @@ export type SignInStep =
   | 'signed-in'
   | 'blocked'
   | 'challenge'
+  | 'foreign-host'
   | 'error'
   | 'otp'
   | 'password'
   | 'identifier'
   | 'waiting';
 
+/**
+ * True when `url` is an https page on waveapps.com or one of its subdomains, the only place
+ * the stored email, password and 2FA code may be typed. Wave's Auth0 runs on its own
+ * `auth.waveapps.com` domain, so nothing in the flow needs another host.
+ */
+export function isWaveSignInUrl(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  const host = parsed.hostname.toLowerCase();
+  // A non-default port is a different server from the one the certificate's host name vouches for in practice.
+  return parsed.protocol === 'https:' && parsed.port === '' && (host === 'waveapps.com' || host.endsWith('.waveapps.com'));
+}
+
 export function classifyPage(s: PageSnapshot): SignInStep {
   if (/Wave Maintenance/i.test(s.title)) return 'blocked';
   if (s.challengeVisible) return 'challenge';
   if (s.hasWaveCookie && parseBusinessIdFromUrl(s.url)) return 'signed-in';
+  // A sign-in form anywhere but Wave is a redirect gone wrong; never fill it.
+  if ((s.usernameVisible || s.passwordVisible || s.otpVisible) && !isWaveSignInUrl(s.url)) return 'foreign-host';
   if (s.errorText) return 'error';
   if (s.otpVisible) return 'otp';
   if (s.passwordVisible) return 'password';
@@ -104,21 +124,23 @@ export async function runAutomatedSignIn(
         throw new SignInChallengeError('Cloudflare blocked the sign-in page');
       case 'challenge':
         throw new SignInChallengeError('Wave showed a CAPTCHA challenge');
+      case 'foreign-host':
+        throw foreignHostError(snap.url);
       case 'error':
         throw new Error(`Wave rejected the sign-in: ${snap.errorText}`);
       case 'identifier':
       case 'password':
         // Auth0 asks for the email, then the password; the older Django form asks for both at once.
         if (!done.identifier && snap.usernameVisible) {
-          await page.fill(SELECTORS.username, input.email);
+          await fillOnWave(page, SELECTORS.username, input.email);
           if (snap.passwordVisible) {
-            await page.fill(SELECTORS.password, input.password);
+            await fillOnWave(page, SELECTORS.password, input.password);
             done.password = true;
           }
           await submit(page);
           done.identifier = true;
         } else if (!done.password && snap.passwordVisible) {
-          await page.fill(SELECTORS.password, input.password);
+          await fillOnWave(page, SELECTORS.password, input.password);
           await submit(page);
           done.password = true;
         }
@@ -157,10 +179,67 @@ async function snapshot(ctx: BrowserContext, page: Page): Promise<PageSnapshot> 
   };
 }
 
+function foreignHostError(url: string): SignInChallengeError {
+  let host = url;
+  try {
+    host = new URL(url).host;
+  } catch {
+    /* name the raw value */
+  }
+  return new SignInChallengeError(`the sign-in form is on ${host}, not Wave, so the stored credentials were not entered`);
+}
+
+/** The parts of a Playwright element handle the secret-entry helpers use. */
+export interface SecretField {
+  evaluate<R>(fn: () => R): Promise<R>;
+  fill(value: string): Promise<void>;
+  click(): Promise<void>;
+  dispose(): Promise<void>;
+}
+
+/** The part of a Playwright page the secret-entry helpers use. */
+export interface SecretFieldSource {
+  waitForSelector(selector: string, options: { state: 'visible'; timeout: number }): Promise<SecretField | null>;
+}
+
+/**
+ * Find a field and check the URL of the document it lives in. A handle belongs to one document: if the
+ * page navigates after this check, the handle is detached and the next action on it throws instead of
+ * typing into the new page. Checking `page.url()` and then calling `page.fill(selector)` would not hold,
+ * because the selector resolves again, possibly in a different document.
+ */
+async function waveField(page: SecretFieldSource, selector: string): Promise<SecretField> {
+  const field = await page.waitForSelector(selector, { state: 'visible', timeout: 5_000 });
+  if (!field) throw new Error(`Wave's sign-in field ${selector} disappeared before it could be filled.`);
+  const href = await field.evaluate(() => String((globalThis as { location?: { href?: unknown } }).location?.href ?? ''));
+  if (!isWaveSignInUrl(href)) {
+    await field.dispose();
+    throw foreignHostError(href);
+  }
+  return field;
+}
+
+/** Type a stored secret into `selector`, only if that field is on a Wave page. */
+export async function fillOnWave(page: SecretFieldSource, selector: string, value: string): Promise<void> {
+  const field = await waveField(page, selector);
+  try {
+    await field.fill(value);
+  } finally {
+    await field.dispose();
+  }
+}
+
 async function enterTotp(page: Page, code: string): Promise<void> {
   await trustThisDevice(page);
-  // Typing last leaves focus in the code boxes, so Enter submits if the button isn't found.
-  await page.click(SELECTORS.otpFirst);
+  // Click through the checked handle, so a navigation since the check makes this throw. Typing then goes
+  // to the focused box, which auto-advances across the six; typing last leaves focus there, so Enter
+  // submits if the button isn't found.
+  const first = await waveField(page, SELECTORS.otpFirst);
+  try {
+    await first.click();
+  } finally {
+    await first.dispose();
+  }
   await page.keyboard.type(code, { delay: 60 });
   await submit(page);
 }
