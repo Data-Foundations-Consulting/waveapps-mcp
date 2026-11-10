@@ -53,7 +53,8 @@ export function isWaveSignInUrl(url: string): boolean {
     return false;
   }
   const host = parsed.hostname.toLowerCase();
-  return parsed.protocol === 'https:' && (host === 'waveapps.com' || host.endsWith('.waveapps.com'));
+  // A non-default port is a different server from the one the certificate's host name vouches for in practice.
+  return parsed.protocol === 'https:' && parsed.port === '' && (host === 'waveapps.com' || host.endsWith('.waveapps.com'));
 }
 
 export function classifyPage(s: PageSnapshot): SignInStep {
@@ -178,38 +179,67 @@ async function snapshot(ctx: BrowserContext, page: Page): Promise<PageSnapshot> 
   };
 }
 
-function foreignHostError(url: string): Error {
+function foreignHostError(url: string): SignInChallengeError {
   let host = url;
   try {
     host = new URL(url).host;
   } catch {
     /* name the raw value */
   }
-  return new Error(
-    `Automatic Wave sign-in stopped: the sign-in form is on ${host}, not Wave, so the stored credentials were not entered. ` +
-      `Run \`${cliCommand('login')}\` and check where the window lands.`,
-  );
+  return new SignInChallengeError(`the sign-in form is on ${host}, not Wave, so the stored credentials were not entered`);
+}
+
+/** The parts of a Playwright element handle the secret-entry helpers use. */
+export interface SecretField {
+  evaluate<R>(fn: () => R): Promise<R>;
+  fill(value: string): Promise<void>;
+  click(): Promise<void>;
+  dispose(): Promise<void>;
+}
+
+/** The part of a Playwright page the secret-entry helpers use. */
+export interface SecretFieldSource {
+  waitForSelector(selector: string, options: { state: 'visible'; timeout: number }): Promise<SecretField | null>;
 }
 
 /**
- * The page may have navigated since the snapshot, so check where it is right before typing a secret.
- * Narrows the window to the fill itself; the snapshot check in classifyPage catches the rest.
+ * Find a field and check the URL of the document it lives in. A handle belongs to one document: if the
+ * page navigates after this check, the handle is detached and the next action on it throws instead of
+ * typing into the new page. Checking `page.url()` and then calling `page.fill(selector)` would not hold,
+ * because the selector resolves again, possibly in a different document.
  */
-function assertOnWave(page: Page): void {
-  const url = page.url();
-  if (!isWaveSignInUrl(url)) throw foreignHostError(url);
+async function waveField(page: SecretFieldSource, selector: string): Promise<SecretField> {
+  const field = await page.waitForSelector(selector, { state: 'visible', timeout: 5_000 });
+  if (!field) throw new Error(`Wave's sign-in field ${selector} disappeared before it could be filled.`);
+  const href = await field.evaluate(() => String((globalThis as { location?: { href?: unknown } }).location?.href ?? ''));
+  if (!isWaveSignInUrl(href)) {
+    await field.dispose();
+    throw foreignHostError(href);
+  }
+  return field;
 }
 
-async function fillOnWave(page: Page, selector: string, value: string): Promise<void> {
-  assertOnWave(page);
-  await page.fill(selector, value);
+/** Type a stored secret into `selector`, only if that field is on a Wave page. */
+export async function fillOnWave(page: SecretFieldSource, selector: string, value: string): Promise<void> {
+  const field = await waveField(page, selector);
+  try {
+    await field.fill(value);
+  } finally {
+    await field.dispose();
+  }
 }
 
 async function enterTotp(page: Page, code: string): Promise<void> {
   await trustThisDevice(page);
-  // Typing last leaves focus in the code boxes, so Enter submits if the button isn't found.
-  assertOnWave(page);
-  await page.click(SELECTORS.otpFirst);
+  // Click through the checked handle, so a navigation since the check makes this throw. Typing then goes
+  // to the focused box, which auto-advances across the six; typing last leaves focus there, so Enter
+  // submits if the button isn't found.
+  const first = await waveField(page, SELECTORS.otpFirst);
+  try {
+    await first.click();
+  } finally {
+    await first.dispose();
+  }
   await page.keyboard.type(code, { delay: 60 });
   await submit(page);
 }
