@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { SignInChallengeError, classifyPage, type PageSnapshot } from './auth0-sign-in.js';
+import { SignInChallengeError, classifyPage, isWaveSignInUrl, type PageSnapshot } from './auth0-sign-in.js';
 
 const BUSINESS_UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 
@@ -51,6 +51,43 @@ describe('classifyPage', () => {
 
   it('waits while redirects are in flight', () => {
     expect(classifyPage(snap({ url: 'https://next.waveapps.com/auth/auth0', title: '' }))).toBe('waiting');
+  });
+
+  it('refuses a sign-in form on any host but Wave', () => {
+    for (const url of [
+      'https://evil.example/u/login/password',
+      'https://waveapps.com.evil.example/login',
+      'https://evilwaveapps.com/login',
+      'http://auth.waveapps.com/u/login/password',
+      'not a url',
+    ]) {
+      expect(classifyPage(snap({ url, usernameVisible: true }))).toBe('foreign-host');
+      expect(classifyPage(snap({ url, passwordVisible: true }))).toBe('foreign-host');
+      expect(classifyPage(snap({ url, otpVisible: true }))).toBe('foreign-host');
+    }
+  });
+
+  it('lets a foreign page with no form through as waiting, mid-redirect', () => {
+    expect(classifyPage(snap({ url: 'https://cdn.example/redirect' }))).toBe('waiting');
+  });
+});
+
+describe('isWaveSignInUrl', () => {
+  it('accepts https on waveapps.com and its subdomains', () => {
+    expect(isWaveSignInUrl('https://auth.waveapps.com/u/login/identifier?state=x')).toBe(true);
+    expect(isWaveSignInUrl('https://my.waveapps.com/login/')).toBe(true);
+    expect(isWaveSignInUrl('https://next.waveapps.com/auth/verify')).toBe(true);
+    expect(isWaveSignInUrl('https://AUTH.WAVEAPPS.COM/u/login')).toBe(true);
+    expect(isWaveSignInUrl('https://waveapps.com/')).toBe(true);
+  });
+
+  it('rejects other hosts, lookalikes, plain http and junk', () => {
+    expect(isWaveSignInUrl('https://waveapps.com.evil.example/')).toBe(false);
+    expect(isWaveSignInUrl('https://evilwaveapps.com/')).toBe(false);
+    expect(isWaveSignInUrl('https://auth.waveapps.com@evil.example/')).toBe(false);
+    expect(isWaveSignInUrl('http://auth.waveapps.com/')).toBe(false);
+    expect(isWaveSignInUrl('about:blank')).toBe(false);
+    expect(isWaveSignInUrl('')).toBe(false);
   });
 });
 

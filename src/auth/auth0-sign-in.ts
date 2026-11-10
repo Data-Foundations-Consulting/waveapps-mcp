@@ -33,16 +33,35 @@ export type SignInStep =
   | 'signed-in'
   | 'blocked'
   | 'challenge'
+  | 'foreign-host'
   | 'error'
   | 'otp'
   | 'password'
   | 'identifier'
   | 'waiting';
 
+/**
+ * True when `url` is an https page on waveapps.com or one of its subdomains, the only place
+ * the stored email, password and 2FA code may be typed. Wave's Auth0 runs on its own
+ * `auth.waveapps.com` domain, so nothing in the flow needs another host.
+ */
+export function isWaveSignInUrl(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  const host = parsed.hostname.toLowerCase();
+  return parsed.protocol === 'https:' && (host === 'waveapps.com' || host.endsWith('.waveapps.com'));
+}
+
 export function classifyPage(s: PageSnapshot): SignInStep {
   if (/Wave Maintenance/i.test(s.title)) return 'blocked';
   if (s.challengeVisible) return 'challenge';
   if (s.hasWaveCookie && parseBusinessIdFromUrl(s.url)) return 'signed-in';
+  // A sign-in form anywhere but Wave is a redirect gone wrong; never fill it.
+  if ((s.usernameVisible || s.passwordVisible || s.otpVisible) && !isWaveSignInUrl(s.url)) return 'foreign-host';
   if (s.errorText) return 'error';
   if (s.otpVisible) return 'otp';
   if (s.passwordVisible) return 'password';
@@ -104,21 +123,23 @@ export async function runAutomatedSignIn(
         throw new SignInChallengeError('Cloudflare blocked the sign-in page');
       case 'challenge':
         throw new SignInChallengeError('Wave showed a CAPTCHA challenge');
+      case 'foreign-host':
+        throw foreignHostError(snap.url);
       case 'error':
         throw new Error(`Wave rejected the sign-in: ${snap.errorText}`);
       case 'identifier':
       case 'password':
         // Auth0 asks for the email, then the password; the older Django form asks for both at once.
         if (!done.identifier && snap.usernameVisible) {
-          await page.fill(SELECTORS.username, input.email);
+          await fillOnWave(page, SELECTORS.username, input.email);
           if (snap.passwordVisible) {
-            await page.fill(SELECTORS.password, input.password);
+            await fillOnWave(page, SELECTORS.password, input.password);
             done.password = true;
           }
           await submit(page);
           done.identifier = true;
         } else if (!done.password && snap.passwordVisible) {
-          await page.fill(SELECTORS.password, input.password);
+          await fillOnWave(page, SELECTORS.password, input.password);
           await submit(page);
           done.password = true;
         }
@@ -157,9 +178,37 @@ async function snapshot(ctx: BrowserContext, page: Page): Promise<PageSnapshot> 
   };
 }
 
+function foreignHostError(url: string): Error {
+  let host = url;
+  try {
+    host = new URL(url).host;
+  } catch {
+    /* name the raw value */
+  }
+  return new Error(
+    `Automatic Wave sign-in stopped: the sign-in form is on ${host}, not Wave, so the stored credentials were not entered. ` +
+      `Run \`${cliCommand('login')}\` and check where the window lands.`,
+  );
+}
+
+/**
+ * The page may have navigated since the snapshot, so check where it is right before typing a secret.
+ * Narrows the window to the fill itself; the snapshot check in classifyPage catches the rest.
+ */
+function assertOnWave(page: Page): void {
+  const url = page.url();
+  if (!isWaveSignInUrl(url)) throw foreignHostError(url);
+}
+
+async function fillOnWave(page: Page, selector: string, value: string): Promise<void> {
+  assertOnWave(page);
+  await page.fill(selector, value);
+}
+
 async function enterTotp(page: Page, code: string): Promise<void> {
   await trustThisDevice(page);
   // Typing last leaves focus in the code boxes, so Enter submits if the button isn't found.
+  assertOnWave(page);
   await page.click(SELECTORS.otpFirst);
   await page.keyboard.type(code, { delay: 60 });
   await submit(page);
